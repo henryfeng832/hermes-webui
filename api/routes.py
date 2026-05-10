@@ -2898,7 +2898,9 @@ def handle_get(handler, parsed) -> bool:
         return True
 
     if parsed.path == "/api/models":
-        return j(handler, get_available_models())
+        from api.profiles import cron_profile_context
+        with cron_profile_context():
+            return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
         return _handle_live_models(handler, parsed)
