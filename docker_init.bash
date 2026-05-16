@@ -25,7 +25,8 @@ export ENV_OBFUSCATE_PART="TOKEN API KEY"
 if [ -z "${ENV_IGNORELIST+x}" ]; then error_exit "ENV_IGNORELIST not set"; fi
 if [ -z "${ENV_OBFUSCATE_PART+x}" ]; then error_exit "ENV_OBFUSCATE_PART not set"; fi
 
-whoami=`whoami`
+# whoami fails under set -e if the UID has no /etc/passwd entry (k8s runAsUser).
+whoami=$(whoami 2>/dev/null || echo "uid-$(id -u)")
 script_dir=$(dirname $0)
 script_name=$(basename $0)
 echo ""; echo ""
@@ -180,6 +181,15 @@ load_env() {
   fi
 }
 
+chown_home_hermeswebui() {
+  # macOS Docker bind mounts can expose hermes-agent git object packs as
+  # read-only host files. The runtime only needs to read those existing objects;
+  # requiring chown on them makes startup fail before WebUI can run (#2237).
+  find /home/hermeswebui \
+    -path "/home/hermeswebui/.hermes/hermes-agent/.git/objects" -prune \
+    -o -exec chown -h "${WANTED_UID}:${WANTED_GID}" {} +
+}
+
 # The production image does not ship sudo. The entrypoint starts as root only
 # long enough to align the hermeswebui UID/GID with mounted volumes, prepare
 # root-owned paths, and then drop privileges for the server process.
@@ -208,7 +218,7 @@ if [ "A${whoami}" == "Aroot" ]; then
     usermod -o -u "${WANTED_UID}" hermeswebui || error_exit "Failed to set UID of hermeswebui user"
   fi
 
-  chown -R "${WANTED_UID}:${WANTED_GID}" /home/hermeswebui || error_exit "Failed to set owner of /home/hermeswebui"
+  chown_home_hermeswebui || error_exit "Failed to set owner of /home/hermeswebui"
 
   echo ""; echo "-- Preparing /app for the hermeswebui runtime user"
   mkdir -p /app || error_exit "Failed to create /app directory"
@@ -227,9 +237,22 @@ if [ "A${whoami}" == "Aroot" ]; then
   chown hermeswebui:hermeswebui "${UV_CACHE_DIR}" || error_exit "Failed to set owner of ${UV_CACHE_DIR} to hermeswebui user"
 
   chown -R "${WANTED_UID}:${WANTED_GID}" "$itdir" || error_exit "Failed to set owner of $itdir"
-  save_env /tmp/hermeswebui_root_env.txt
-  chown "${WANTED_UID}:${WANTED_GID}" /tmp/hermeswebui_root_env.txt || error_exit "Failed to set owner of /tmp/hermeswebui_root_env.txt"
-  chmod 600 /tmp/hermeswebui_root_env.txt || error_exit "Failed to secure /tmp/hermeswebui_root_env.txt"
+  # Issue #2010 — Railway / user-namespaced runtimes: in-container UID 0 may map
+  # to a host UID outside the writable subuid range, so /tmp writes fail despite
+  # id -u == 0. Probe writability and fall back through $itdir → /app.
+  ENV_FILE="/tmp/hermeswebui_root_env.txt"
+  if ! ( : > "$ENV_FILE" ) 2>/dev/null; then
+    ENV_FILE="${itdir:-/tmp/hermeswebui_init}/hermeswebui_root_env.txt"
+    mkdir -p "$(dirname "$ENV_FILE")" 2>/dev/null
+    if ! ( : > "$ENV_FILE" ) 2>/dev/null; then
+      ENV_FILE="/app/.hermeswebui_root_env"
+    fi
+    echo "  !! /tmp not writable by root — falling back to $ENV_FILE (user-namespaced runtime?)"
+  fi
+  save_env "$ENV_FILE"
+  chown "${WANTED_UID}:${WANTED_GID}" "$ENV_FILE" || error_exit "Failed to set owner of $ENV_FILE"
+  chmod 600 "$ENV_FILE" || error_exit "Failed to secure $ENV_FILE"
+  export _HW_ROOT_ENV_PATH="$ENV_FILE"
 
   # restart the script as hermeswebui set with the correct UID/GID this time
   echo "-- Restarting as hermeswebui user with UID ${WANTED_UID} GID ${WANTED_GID}"
@@ -248,13 +271,18 @@ if [ "$WANTED_UID" != "$new_uid" ]; then error_exit "hermeswebui MUST be running
 echo ""; echo "== Running as hermeswebui"
 
 # Load environment variables one by one if they do not exist from the root init phase
-tmp_root_env=/tmp/hermeswebui_root_env.txt
+tmp_root_env="${_HW_ROOT_ENV_PATH:-/tmp/hermeswebui_root_env.txt}"
 if [ -f $tmp_root_env ]; then
   echo "-- Loading not already set environment variables from $tmp_root_env"
   load_env $tmp_root_env true
 fi
 
 ##
+if [ ! -f /app/server.py ] && [ -d /apptoo ]; then
+  echo ""; echo "-- Seeding /app from /apptoo (rootless startup)"
+  cp -a /apptoo/. /app/ || error_exit "Failed to seed /app from /apptoo (is /app writable by the runtime user?)"
+fi
+
 echo ""; echo "-- Verifying /app is writable by the hermeswebui runtime user"
 if [ ! -d /app ]; then error_exit "/app directory does not exist"; fi
 it=/app/.testfile; touch $it || error_exit "Failed to verify /app directory"
@@ -264,7 +292,7 @@ rm -f $it || error_exit "Failed to delete test file in /app"
 
 echo ""; echo "== Checking required environment variables for hermes-webui"
 
-echo ""; echo "-- HERMES_WEBUI_VERSION: Where to store sessions, workspaces, and other state (default: ~/.hermes/webui-mvp)"
+echo ""; echo "-- HERMES_WEBUI_STATE_DIR: Where to store sessions, workspaces, and other state (default: ~/.hermes/webui)"
 if [ -z "${HERMES_WEBUI_STATE_DIR+x}" ]; then error_exit "HERMES_WEBUI_STATE_DIR not set"; fi; 
 echo "-- HERMES_WEBUI_STATE_DIR: $HERMES_WEBUI_STATE_DIR"
 if [ ! -d "$HERMES_WEBUI_STATE_DIR" ]; then mkdir -p $HERMES_WEBUI_STATE_DIR || error_exit "Failed to create state directory at $HERMES_WEBUI_STATE_DIR"; fi
